@@ -1,0 +1,291 @@
+import { PlaygroundPromptType } from "@/types/playground";
+import { generateRandomString } from "@/lib/utils";
+import {
+  DEFAULT_ANTHROPIC_CONFIGS,
+  DEFAULT_GEMINI_CONFIGS,
+  DEFAULT_OPEN_AI_CONFIGS,
+  DEFAULT_OPEN_ROUTER_CONFIGS,
+  DEFAULT_VERTEX_AI_CONFIGS,
+  DEFAULT_CUSTOM_CONFIGS,
+} from "@/constants/llm";
+import {
+  getDefaultTemperatureForModel,
+  getDefaultThinkingLevel,
+  isClaudeModel,
+  supportsAnthropicThinkingEffort,
+  supportsGeminiThinkingLevel,
+  supportsOpenAIReasoningEffort,
+  supportsSamplingParams,
+  supportsVertexAIThinkingLevel,
+} from "@/lib/modelUtils";
+import {
+  LLMAnthropicConfigsType,
+  LLMGeminiConfigsType,
+  LLMOpenAIConfigsType,
+  LLMOpenRouterConfigsType,
+  LLMPromptConfigsType,
+  LLMVertexAIConfigsType,
+  LLMCustomConfigsType,
+  PROVIDER_MODEL_TYPE,
+  PROVIDER_TYPE,
+  COMPOSED_PROVIDER_TYPE,
+} from "@/types/providers";
+import { generateDefaultLLMPromptMessage } from "@/lib/llm";
+import {
+  ModelResolver,
+  ProviderResolver,
+} from "@/hooks/useLLMProviderModelsData";
+import { RunStreamingReturn } from "@/api/playground/useCompletionProxyStreaming";
+import { parseComposedProviderType } from "@/lib/provider";
+
+/**
+ * Fills in config parameters a stored prompt has no value for, from the provider defaults.
+ *
+ * Two ways a prompt ends up short of one. It was persisted before the parameter existed, or an
+ * earlier model change cleared it: the reconciler used to overwrite a parameter the newly picked
+ * model rejected, and the panels render one control per parameter the config carries, so the
+ * control stayed gone for good (a playground reset was the only way back).
+ *
+ * Only absent parameters are filled; a value the user chose is never overwritten. The
+ * temperature/topP pair is skipped where the provider takes one or the other — restoring
+ * temperature next to a live Top P would make the request drop the Top P. resolveSamplingParams
+ * settles which half is live for those.
+ */
+export const restoreMissingConfigKeys = (
+  prompt: PlaygroundPromptType,
+): PlaygroundPromptType => {
+  // Runs over every stored prompt during hydration, so anything this touches has to tolerate a
+  // corrupted entry: throwing costs every sibling prompt's state, not just this one's. The
+  // parameter type is a claim about persisted JSON, not a guarantee, so the shape is checked
+  // rather than trusted — an entry it cannot read is returned untouched.
+  if (!prompt || typeof prompt !== "object") {
+    return prompt;
+  }
+
+  // parseComposedProviderType calls provider.startsWith.
+  if (!prompt.provider || typeof prompt.provider !== "string") {
+    return prompt;
+  }
+
+  const defaults = getDefaultConfigByProvider(prompt.provider, prompt.model) as
+    | Record<string, unknown>
+    | undefined;
+
+  if (!defaults) {
+    return prompt;
+  }
+
+  // Claude rejects temperature and top_p together whoever serves it, so a stored config carrying
+  // neither is a deliberate choice — restoring the provider's defaults would silently turn it back
+  // into temperature-at-default on the next reload.
+  const exclusiveSamplingPair =
+    parseComposedProviderType(prompt.provider) === PROVIDER_TYPE.ANTHROPIC ||
+    (typeof prompt.model === "string" && isClaudeModel(prompt.model));
+  const stored = prompt.configs as Record<string, unknown> | undefined | null;
+  const configs = stored ?? {};
+  const restored: Record<string, unknown> = { ...configs };
+  let changed = stored == null;
+
+  for (const [key, value] of Object.entries(defaults)) {
+    // A stored null is as absent as a missing key, and a default that is itself nullish (Custom's
+    // custom_parameters) has nothing to restore.
+    if (value == null || configs[key] != null) {
+      continue;
+    }
+    if (exclusiveSamplingPair && (key === "temperature" || key === "topP")) {
+      continue;
+    }
+    restored[key] = value;
+    changed = true;
+  }
+
+  return changed
+    ? { ...prompt, configs: restored as unknown as LLMPromptConfigsType }
+    : prompt;
+};
+
+export const getDefaultConfigByProvider = (
+  provider: COMPOSED_PROVIDER_TYPE,
+  model?: PROVIDER_MODEL_TYPE | "",
+): LLMPromptConfigsType => {
+  const providerType = parseComposedProviderType(provider);
+
+  if (providerType === PROVIDER_TYPE.OPEN_AI) {
+    const config: LLMOpenAIConfigsType = {
+      temperature: getDefaultTemperatureForModel(model),
+      maxCompletionTokens: DEFAULT_OPEN_AI_CONFIGS.MAX_COMPLETION_TOKENS,
+      topP: DEFAULT_OPEN_AI_CONFIGS.TOP_P,
+      frequencyPenalty: DEFAULT_OPEN_AI_CONFIGS.FREQUENCY_PENALTY,
+      presencePenalty: DEFAULT_OPEN_AI_CONFIGS.PRESENCE_PENALTY,
+      throttling: DEFAULT_OPEN_AI_CONFIGS.THROTTLING,
+      maxConcurrentRequests: DEFAULT_OPEN_AI_CONFIGS.MAX_CONCURRENT_REQUESTS,
+    };
+
+    if (supportsOpenAIReasoningEffort(model)) {
+      config.reasoningEffort = "high";
+    }
+
+    return config;
+  }
+
+  if (providerType === PROVIDER_TYPE.ANTHROPIC) {
+    const acceptsSamplingParams = supportsSamplingParams(model);
+    const config: LLMAnthropicConfigsType = {
+      temperature: acceptsSamplingParams
+        ? DEFAULT_ANTHROPIC_CONFIGS.TEMPERATURE
+        : undefined,
+      maxCompletionTokens: DEFAULT_ANTHROPIC_CONFIGS.MAX_COMPLETION_TOKENS,
+      topP: undefined,
+      throttling: DEFAULT_ANTHROPIC_CONFIGS.THROTTLING,
+      maxConcurrentRequests: DEFAULT_ANTHROPIC_CONFIGS.MAX_CONCURRENT_REQUESTS,
+    };
+
+    if (supportsAnthropicThinkingEffort(model)) {
+      config.thinkingEffort = "high";
+    }
+
+    return config;
+  }
+
+  if (providerType === PROVIDER_TYPE.OPEN_ROUTER) {
+    return {
+      maxTokens: DEFAULT_OPEN_ROUTER_CONFIGS.MAX_TOKENS,
+      temperature: DEFAULT_OPEN_ROUTER_CONFIGS.TEMPERATURE,
+      topP: DEFAULT_OPEN_ROUTER_CONFIGS.TOP_P,
+      topK: DEFAULT_OPEN_ROUTER_CONFIGS.TOP_K,
+      frequencyPenalty: DEFAULT_OPEN_ROUTER_CONFIGS.FREQUENCY_PENALTY,
+      presencePenalty: DEFAULT_OPEN_ROUTER_CONFIGS.PRESENCE_PENALTY,
+      repetitionPenalty: DEFAULT_OPEN_ROUTER_CONFIGS.REPETITION_PENALTY,
+      minP: DEFAULT_OPEN_ROUTER_CONFIGS.MIN_P,
+      topA: DEFAULT_OPEN_ROUTER_CONFIGS.TOP_A,
+      throttling: DEFAULT_OPEN_ROUTER_CONFIGS.THROTTLING,
+      maxConcurrentRequests:
+        DEFAULT_OPEN_ROUTER_CONFIGS.MAX_CONCURRENT_REQUESTS,
+    } as LLMOpenRouterConfigsType;
+  }
+
+  if (providerType === PROVIDER_TYPE.GEMINI) {
+    const config: LLMGeminiConfigsType = {
+      temperature: DEFAULT_GEMINI_CONFIGS.TEMPERATURE,
+      maxCompletionTokens: DEFAULT_GEMINI_CONFIGS.MAX_COMPLETION_TOKENS,
+      topP: DEFAULT_GEMINI_CONFIGS.TOP_P,
+      throttling: DEFAULT_GEMINI_CONFIGS.THROTTLING,
+      maxConcurrentRequests: DEFAULT_GEMINI_CONFIGS.MAX_CONCURRENT_REQUESTS,
+    };
+
+    if (supportsGeminiThinkingLevel(model)) {
+      config.thinkingLevel = getDefaultThinkingLevel(model);
+    }
+
+    return config;
+  }
+
+  if (providerType === PROVIDER_TYPE.VERTEX_AI) {
+    const config: LLMVertexAIConfigsType = {
+      temperature: DEFAULT_VERTEX_AI_CONFIGS.TEMPERATURE,
+      maxCompletionTokens: DEFAULT_VERTEX_AI_CONFIGS.MAX_COMPLETION_TOKENS,
+      topP: DEFAULT_VERTEX_AI_CONFIGS.TOP_P,
+      throttling: DEFAULT_VERTEX_AI_CONFIGS.THROTTLING,
+      maxConcurrentRequests: DEFAULT_VERTEX_AI_CONFIGS.MAX_CONCURRENT_REQUESTS,
+    };
+
+    if (supportsVertexAIThinkingLevel(model)) {
+      config.thinkingLevel = getDefaultThinkingLevel(model);
+    }
+
+    return config;
+  }
+
+  if (providerType === PROVIDER_TYPE.CUSTOM) {
+    return {
+      temperature: DEFAULT_CUSTOM_CONFIGS.TEMPERATURE,
+      maxCompletionTokens: DEFAULT_CUSTOM_CONFIGS.MAX_COMPLETION_TOKENS,
+      topP: DEFAULT_CUSTOM_CONFIGS.TOP_P,
+      frequencyPenalty: DEFAULT_CUSTOM_CONFIGS.FREQUENCY_PENALTY,
+      presencePenalty: DEFAULT_CUSTOM_CONFIGS.PRESENCE_PENALTY,
+      custom_parameters: DEFAULT_CUSTOM_CONFIGS.CUSTOM_PARAMETERS,
+      throttling: DEFAULT_CUSTOM_CONFIGS.THROTTLING,
+      maxConcurrentRequests: DEFAULT_CUSTOM_CONFIGS.MAX_CONCURRENT_REQUESTS,
+    } as LLMCustomConfigsType;
+  }
+
+  return {};
+};
+
+interface GenerateDefaultPromptParams {
+  initPrompt?: Partial<PlaygroundPromptType>;
+  setupProviders: COMPOSED_PROVIDER_TYPE[];
+  lastPickedModel?: PROVIDER_MODEL_TYPE | "";
+  providerResolver: ProviderResolver;
+  modelResolver: ModelResolver;
+}
+
+export const generateDefaultPrompt = ({
+  initPrompt = {},
+  setupProviders = [],
+  lastPickedModel,
+  providerResolver,
+  modelResolver,
+}: GenerateDefaultPromptParams): PlaygroundPromptType => {
+  const modelByDefault = modelResolver(lastPickedModel || "", setupProviders);
+  const provider = providerResolver(modelByDefault);
+
+  return {
+    name: "Prompt",
+    messages: [generateDefaultLLMPromptMessage()],
+    model: modelByDefault,
+    provider,
+    configs: getDefaultConfigByProvider(provider, modelByDefault),
+    ...initPrompt,
+    id: generateRandomString(),
+  };
+};
+
+export const parseCompletionOutput = (run: RunStreamingReturn) => {
+  return (
+    run.result ||
+    run.opikError ||
+    run.providerError ||
+    run.pythonProxyError ||
+    "The AI provider returned an empty response. Please, try again."
+  );
+};
+
+export const parseCompletionError = (run: RunStreamingReturn) => {
+  if (run.opikError) {
+    return { exceptionType: "OpikError", message: run.opikError };
+  }
+  if (run.providerError) {
+    return { exceptionType: "ProviderError", message: run.providerError };
+  }
+  if (run.pythonProxyError) {
+    return { exceptionType: "PythonProxyError", message: run.pythonProxyError };
+  }
+  return null;
+};
+
+export const createCompletionAnnouncer = (
+  expected: number,
+  announce: () => void,
+) => {
+  let registered = 0;
+  let hasFinishedLogging = false;
+  let hasAnnounced = false;
+
+  const fire = () => {
+    if (!hasFinishedLogging || registered < expected || hasAnnounced) return;
+    hasAnnounced = true;
+    announce();
+  };
+
+  return {
+    experimentsRegistered: (count: number) => {
+      registered = count;
+      fire();
+    },
+    loggingFinished: () => {
+      hasFinishedLogging = true;
+      fire();
+    },
+  };
+};

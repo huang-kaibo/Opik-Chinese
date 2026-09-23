@@ -1,0 +1,448 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { OpikClient } from "@/client/Client";
+import { isTracingActive } from "@/config/TracingRuntimeConfig";
+import { logger } from "@/utils/logger";
+import { SpanType } from "@/rest_api/api/types/SpanType";
+import { Span } from "@/tracer/Span";
+import { Trace } from "@/tracer/Trace";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { getPresetTraceId } from "@/runner/context";
+import { register, extractParams, type Param } from "@/runner/registry";
+import { activateRunner } from "@/runner/activate";
+
+type TrackContext =
+  | {
+      span?: Span;
+      trace?: Trace;
+    }
+  | { span: Span; trace: Trace };
+
+const DEFAULT_TRACK_NAME = "track.decorator";
+
+export const trackStorage = new AsyncLocalStorage<TrackContext>();
+
+export const getTrackContext = (): Required<TrackContext> | undefined => {
+  const { span, trace } = trackStorage.getStore() || {};
+
+  if (!span || !trace) {
+    return undefined;
+  }
+
+  return { span, trace };
+};
+
+function isPromise(obj: any): obj is Promise<any> {
+  return (
+    !!obj &&
+    (typeof obj === "object" || typeof obj === "function") &&
+    typeof obj.then === "function"
+  );
+}
+
+function logSpan({
+  name,
+  parentSpan,
+  projectName,
+  trace,
+  type = "llm",
+  environment,
+}: {
+  name: string;
+  parentSpan?: Span;
+  projectName?: string;
+  trace?: Trace;
+  type?: SpanType;
+  environment?: string;
+}) {
+  logger.debug("Creating new span:", {
+    name,
+    parentSpan: parentSpan?.data.id,
+    projectName,
+    type,
+    environment,
+  });
+  let spanTrace = trace;
+
+  if (!spanTrace) {
+    const presetTraceId = getPresetTraceId();
+    spanTrace = getTrackOpikClient().trace({
+      name,
+      projectName,
+      ...(environment !== undefined ? { environment } : {}),
+      ...(presetTraceId ? { id: presetTraceId } : {}),
+    });
+  } else if (
+    environment !== undefined &&
+    environment !== spanTrace.data.environment
+  ) {
+    logger.warn(
+      `Nested @track requested environment "${environment}", but the enclosing trace already uses "${spanTrace.data.environment ?? "(none)"}". The outer environment will be used.`
+    );
+  }
+
+  const span = spanTrace.span({
+    name,
+    parentSpanId: parentSpan?.data.id,
+    projectName,
+    type,
+  });
+
+  logger.debug("Span created with ID:", span.data.id);
+  return { span, trace: spanTrace };
+}
+
+function logStart({
+  args,
+  span,
+  trace,
+}: {
+  args: any[];
+  span: Span;
+  trace?: Trace;
+}) {
+  logger.debug("Starting span execution:", {
+    spanId: span.data.id,
+    traceId: trace?.data.id,
+  });
+  if (args.length === 0) {
+    return;
+  }
+
+  const input = { arguments: args };
+  logger.debug("Recording span input");
+  span.update({ input });
+
+  if (trace) {
+    logger.debug("Recording trace input");
+    trace.update({ input });
+  }
+}
+
+function logSuccess({
+  result,
+  span,
+  trace,
+  enrichSpan,
+}: {
+  result: any;
+  span: Span;
+  trace?: Trace;
+  enrichSpan?: (result: any) => Record<string, unknown>;
+}) {
+  logger.debug("Recording successful execution:", {
+    spanId: span.data.id,
+    traceId: trace?.data.id,
+  });
+  const output = typeof result === "object" ? result : { result };
+  const endTime = new Date();
+
+  // Build the update object with standard fields
+  const spanUpdate: Record<string, unknown> = { endTime, output };
+
+  // Enrich the span with additional data if enrichSpan function is provided
+  if (enrichSpan) {
+    const enrichedData = enrichSpan(result);
+    Object.assign(spanUpdate, enrichedData);
+  }
+
+  span.update(spanUpdate);
+
+  if (trace) {
+    trace.update({ endTime, output });
+  }
+}
+
+/**
+ * Turns whatever was thrown into the `ErrorInfo` the span and trace report. Nothing in here may
+ * propagate: this runs inside `executeTrack`'s catch, so an exception would replace the caller's
+ * own failure and skip both `end()` calls. Reading `message`/`name`/`stack` off a non-`Error` does
+ * that for `null`/`undefined`, and `String()` itself throws for a value that cannot be converted
+ * to a primitive (`Object.create(null)`) or whose `toString` throws.
+ */
+function toErrorInfo(error: unknown): {
+  message: string;
+  exceptionType: string;
+  traceback: string;
+} {
+  try {
+    const err = error instanceof Error ? error : new Error(String(error));
+    return {
+      message: err.message,
+      exceptionType: err.name,
+      // A coerced non-Error has no stack of its own, and the one `new Error()` would
+      // capture here points at this decorator rather than at the caller's code.
+      traceback: error instanceof Error ? (err.stack ?? "") : "",
+    };
+  } catch {
+    return {
+      message: "<thrown value could not be described>",
+      exceptionType: "Error",
+      traceback: "",
+    };
+  }
+}
+
+function logError({
+  span,
+  error,
+  trace,
+}: {
+  span: Span;
+  error: any;
+  trace?: Trace;
+}) {
+  const errorInfo = toErrorInfo(error);
+
+  logger.error("Recording execution error:", {
+    spanId: span.data.id,
+    traceId: trace?.data.id,
+    // `errorInfo` is what the backend receives; the log line keeps its pre-existing
+    // { name, message, stack } shape so log consumers that match those keys still work.
+    error:
+      error instanceof Error
+        ? {
+            name: errorInfo.exceptionType,
+            message: errorInfo.message,
+            stack: errorInfo.traceback,
+          }
+        : error,
+  });
+
+  span.update({ errorInfo });
+  span.end();
+
+  if (trace) {
+    trace.update({ errorInfo });
+    trace.end();
+  }
+}
+
+function executeTrack<T extends (...args: any[]) => any>(
+  {
+    name,
+    projectName,
+    type,
+    enrichSpan,
+    environment,
+  }: {
+    name?: string;
+    projectName?: string;
+    type?: SpanType;
+    enrichSpan?: (result: any) => Record<string, unknown>;
+    environment?: string;
+  } = {},
+  originalFn: T
+): T {
+  const wrappedFn = function (this: any, ...args: any[]): ReturnType<T> {
+    if (!isTracingActive()) {
+      return originalFn.apply(this, args);
+    }
+
+    const context = trackStorage.getStore();
+    const { span, trace } = logSpan({
+      name: name ?? (originalFn.name || DEFAULT_TRACK_NAME),
+      parentSpan: context?.span,
+      projectName,
+      trace: context?.trace,
+      type,
+      environment,
+    });
+    const isRootSpan = !context;
+    const fnThis = this as any;
+
+    return trackStorage.run({ span, trace }, () => {
+      const currentTrace = isRootSpan ? trace : undefined;
+      try {
+        logStart({ args, span, trace: currentTrace });
+
+        const result = originalFn.apply(fnThis, args);
+
+        if (isPromise(result)) {
+          return result.then(
+            (res: any) => {
+              logSuccess({
+                span,
+                result: res,
+                trace: currentTrace,
+                enrichSpan,
+              });
+              return res;
+            },
+            (err) => {
+              logError({
+                span,
+                error: err,
+                trace: currentTrace,
+              });
+
+              throw err;
+            }
+          ) as ReturnType<T>;
+        }
+
+        logSuccess({
+          span,
+          result,
+          trace: currentTrace,
+          enrichSpan,
+        });
+
+        return result;
+      } catch (error) {
+        logError({
+          span,
+          error,
+          trace: currentTrace,
+        });
+        throw error;
+      }
+    });
+  };
+
+  return wrappedFn as T;
+}
+
+type TrackOptions = {
+  name?: string;
+  projectName?: string;
+  type?: SpanType;
+  /**
+   * Environment to tag the trace with. When the root @track creates the
+   * trace, the value is persisted on the trace and inherited by all child
+   * spans. Per-call values on nested @track calls are ignored — the
+   * trace's environment always wins.
+   */
+  environment?: string;
+  /**
+   * Optional function to enrich the span with additional data extracted from the result.
+   * Called before the span is finalized with the success result.
+   *
+   * @param result - The return value from the tracked function
+   * @returns An object with fields to merge into the span (usage, model, provider, metadata, etc.)
+   */
+  enrichSpan?: (result: any) => Record<string, unknown>;
+  /**
+   * When true, registers this function as a runner entrypoint.
+   * The function will be available for remote execution via the Opik runner.
+   * Only effective when used with the function wrapper syntax: track({ entrypoint: true }, fn)
+   */
+  entrypoint?: boolean;
+  /**
+   * Explicit parameter descriptors for the entrypoint function.
+   * Use this when the SDK is bundled/minified (parameter names are mangled at build time).
+   * If omitted, parameter names are extracted from the function source at runtime.
+   */
+  params?: Param[];
+};
+
+type OriginalFunction = (...args: any[]) => any;
+
+export function track(
+  optionsOrOriginalFunction: TrackOptions | OriginalFunction,
+  originalFunction?: OriginalFunction
+) {
+  if (typeof optionsOrOriginalFunction === "function") {
+    return executeTrack({}, optionsOrOriginalFunction);
+  }
+
+  const options = optionsOrOriginalFunction;
+
+  if (originalFunction) {
+    const wrapped = executeTrack(options, originalFunction);
+    if (options.entrypoint) {
+      applyEntrypoint(originalFunction, wrapped, options);
+    }
+    return wrapped;
+  }
+
+  return function (...args: any[]): any {
+    // New decorator API: (value, context)
+    if (
+      args.length === 2 &&
+      typeof args[1] === "object" &&
+      args[1] !== null &&
+      "kind" in args[1]
+    ) {
+      const [originalMethod, context] = args as [
+        (...args: any[]) => any,
+        { kind: string; name: string | symbol },
+      ];
+
+      if (context.kind !== "method") {
+        throw new Error("track decorator is only applicable to methods");
+      }
+
+      return executeTrack(options, originalMethod);
+    }
+
+    // Legacy decorator API: (target, propertyKey, descriptor)
+    const [, , descriptor] = args as [
+      object,
+      string | symbol,
+      PropertyDescriptor,
+    ];
+
+    if (!descriptor || typeof descriptor.value !== "function") {
+      throw new Error("track decorator can only be applied to methods");
+    }
+
+    const originalMethod = descriptor.value;
+    descriptor.value = executeTrack(options, originalMethod);
+    return descriptor;
+  };
+}
+
+function applyEntrypoint(
+  originalFn: OriginalFunction,
+  wrappedFn: OriginalFunction,
+  options: TrackOptions
+): void {
+  const agentName = options.name || originalFn.name;
+  if (!agentName) {
+    throw new Error(
+      "entrypoint functions must have a name. Provide one via track({ name: '...' }) or use a named function."
+    );
+  }
+  const agentProject =
+    options.projectName || getTrackOpikClient().config.projectName;
+  const rawParams = options.params ?? extractParams(originalFn);
+
+  const supportedTypes = new Set(["string", "number", "float", "integer", "boolean"]);
+  const unsupported = rawParams.filter((p) => !supportedTypes.has(p.type));
+  if (unsupported.length > 0) {
+    const names = unsupported.map((p) => `${p.name} (${p.type})`);
+    logger.warn(
+      `Could not resolve type for parameter(s) [${names.join(", ")}] in "${agentName}". ` +
+        `These parameters will default to 'string' and cannot be modified via the UI. ` +
+        `Consider using a supported type (string, number, boolean) or choosing a different entrypoint.`
+    );
+  }
+
+  const params = rawParams.map((p) => ({
+    ...p,
+    type: p.type === "number" ? "float" : p.type,
+  }));
+
+  register({
+    func: wrappedFn,
+    name: agentName,
+    project: agentProject,
+    params,
+    docstring: "",
+  });
+
+  activateRunner();
+}
+
+let _cachedTrackOpikClient: OpikClient | null = null;
+
+export function getTrackOpikClient(): OpikClient {
+  if (_cachedTrackOpikClient === null) {
+    _cachedTrackOpikClient = new OpikClient();
+  }
+  return _cachedTrackOpikClient;
+}
+
+export function _resetTrackOpikClientCache(): void {
+  _cachedTrackOpikClient = null;
+}

@@ -1,0 +1,125 @@
+# Contributing to Opik
+
+Thanks for your interest in contributing to Opik.
+
+If you are looking for setup instructions and contribution workflows, start with our docs:
+- Contribution overview: https://www.comet.com/docs/opik/contributing/overview
+- Local development setup: https://www.comet.com/docs/opik/contributing/guides/local-development
+
+You can also read and edit those docs directly in this repository:
+- `apps/opik-documentation/documentation/fern/docs-v2/contributing/overview.mdx`
+- `apps/opik-documentation/documentation/fern/docs-v2/contributing/guides/local-development.mdx`
+
+Please review the CLA before contributing:
+- https://github.com/comet-ml/opik/blob/main/CLA.md
+
+## Repository layout at a glance
+- `apps/`: deployable services and product surfaces (backend, frontend, docs, and supporting backends)
+- `sdks/`: SDKs (`python`, `typescript`, `opik_optimizer`) and code generation
+- `tests_end_to_end/`: end-to-end suites and helpers
+- `deployment/`: Docker and Helm deployment assets
+
+## Component-specific guides
+- Backend:
+  - Docs: https://www.comet.com/docs/opik/contributing/guides/backend
+  - Source: `apps/opik-documentation/documentation/fern/docs-v2/contributing/guides/backend.mdx`
+- Frontend:
+  - Docs: https://www.comet.com/docs/opik/contributing/guides/frontend
+  - Source: `apps/opik-documentation/documentation/fern/docs-v2/contributing/guides/frontend.mdx`
+- Python SDK:
+  - Docs: https://www.comet.com/docs/opik/contributing/guides/python-sdk
+  - Source: `apps/opik-documentation/documentation/fern/docs-v2/contributing/guides/python-sdk.mdx`
+- TypeScript SDK:
+  - Docs: https://www.comet.com/docs/opik/contributing/guides/typescript-sdk
+  - Source: `apps/opik-documentation/documentation/fern/docs-v2/contributing/guides/typescript-sdk.mdx`
+- Documentation:
+  - Docs: https://www.comet.com/docs/opik/contributing/guides/documentation
+  - Source: `apps/opik-documentation/documentation/fern/docs-v2/contributing/guides/documentation.mdx`
+- Agent Optimizer SDK:
+  - Docs: https://www.comet.com/docs/opik/contributing/guides/agent-optimizer-sdk
+  - Source: `apps/opik-documentation/documentation/fern/docs-v2/contributing/guides/agent-optimizer-sdk.mdx`
+
+## Fast path
+1. Open or confirm a tracked issue first (`Fixes #...` or `Resolves #...`).
+2. Create a branch: `{username}/{ticket}-{summary}` where ticket is `OPIK-####`, `issue-####`, or `NA`.
+3. Keep changes scoped to the requested area.
+4. Run relevant formatters, linters, and tests before opening a PR.
+5. Open a draft PR with GitHub CLI: `gh pr create --draft`.
+6. Fill `.github/pull_request_template.md` completely.
+
+## GitHub Actions workflows
+Workflow files in `.github/workflows/` are validated with [actionlint](https://github.com/rhysd/actionlint), which runs as a hook in the unified `🐙 Code Quality` workflow (and locally via pre-commit) on changed workflow files. The pre-commit framework builds the pinned actionlint from source automatically — no manual install needed. Run `make hooks` once per clone to enable it locally.
+
+Workflows are also scanned for **security** issues with [zizmor](https://github.com/zizmorcore/zizmor) (Trail of Bits), which runs as a hook in the same `🐙 Code Quality` workflow (and locally via pre-commit) on changed workflow and composite-action files. actionlint and zizmor solve different problems: actionlint asks *"will this YAML run?"* (syntax, expressions, shellcheck on `run:` blocks); zizmor asks *"if it runs, can it be exploited?"* (template injection, dangerous triggers, excessive `GITHUB_TOKEN` permissions, cache poisoning). The pre-commit framework installs the pinned zizmor automatically — no manual install needed.
+
+- **Severity floor.** The hook runs at `--min-severity high --persona regular --offline`, so it blocks only high-confidence, high-severity findings and never makes network calls (no GitHub API rate limits). Lower-severity findings are surfaced by running zizmor directly (below) but are not PR-blocking.
+- **Rule tuning** lives in [`.github/zizmor.yml`](.github/zizmor.yml) (auto-discovered). The `unpinned-uses` rule (pin every `uses:` to a commit SHA) is currently disabled there pending a separate SHA-pinning migration; re-enabling it is the final step of that follow-up.
+- **Run it locally** against the whole repo: `brew install zizmor` (or `cargo install zizmor`), then `zizmor --offline .github/workflows/`. To reproduce exactly what CI blocks on, add `--min-severity high --persona regular`.
+- **Suppressing a finding** must be explicit and justified — never silent. Use an inline `# zizmor: ignore[<audit-id>]` comment with a short rationale (see the `pull_request_target` exemption in [`.github/workflows/labeler.yml`](.github/workflows/labeler.yml) for the pattern), or a scoped entry in `.github/zizmor.yml`.
+- **Fixing `template-injection`.** Don't interpolate `${{ … }}` directly into a `run:` shell body; hoist the expression into the step's `env:` block and reference it as a shell variable (`"${MY_VAR}"`, quoted). This keeps attacker-influenceable values (branch names, PR titles, usernames) out of the shell's parse phase.
+
+### E2E tests on pull requests from forks
+E2E workflows are skipped on pull requests opened from a fork, and their checks will show as **skipped** rather than passed or failed. This is expected and is not something your PR can fix.
+
+GitHub issues a read-only `GITHUB_TOKEN` to fork-originated `pull_request` events regardless of a workflow's `permissions:` block, and regardless of whether a maintainer approved the run. The shared E2E build pushes images to GHCR, so on a fork it fails with a 403 before any test executes. Skipping keeps that structural failure from showing up as a red check you cannot act on.
+
+A maintainer can run the E2E suite against your branch before merging. The skip is temporary and will be removed once fork PRs can run E2E directly.
+
+## Dockerfiles
+Dockerfiles are linted with [hadolint](https://github.com/hadolint/hadolint), which runs as a hook in the unified `🐙 Code Quality` workflow (and locally via pre-commit) on changed Dockerfiles. It uses hadolint's default rule set; the handful of intentionally-suppressed rules are annotated inline in each Dockerfile with a `# hadolint ignore=` comment and a reason. The hook runs hadolint via its Docker image, so it needs only Docker — no manual install. To run it directly on a single file: `docker run --rm -i ghcr.io/hadolint/hadolint < path/to/Dockerfile`.
+
+## SQL query construction (Java backend)
+Production Java under `apps/opik-backend/src/main/java/` is scanned with [semgrep](https://semgrep.dev/) for SQL assembled by string formatting, as a hook in the unified `🐙 Code Quality` workflow (and locally via pre-commit). The rules live in [`.semgrep/`](.semgrep/), with the conventions they enforce documented in [`.agents/rules/security.mdc`](.agents/rules/security.mdc) and the backend skill.
+
+## Generated files (do not edit manually)
+- `apps/opik-backend/src/main/resources/model_prices_and_context_window.json`
+- `apps/opik-frontend/src/data/model_prices_and_context_window.json`
+
+These files are regenerated by automation from upstream `BerriAI/litellm`. Use the updater workflow or approved automation, not direct edits.
+
+## Commit and PR conventions
+- First commit (used as PR title source):
+  - `[<TICKET-KEY>] [BE|FE|SDK|DOCS|INFRA|NA] <type>: <summary>`
+- Follow-up commits:
+  - `<type>(<scope>): <summary>` where type is one of `feat`, `fix`, `refactor`, `test`, `docs`, `chore`.
+- Include screenshots/videos for user-facing UI changes.
+- Keep customer names, non-public internal references, and sensitive operational context out of public PR text.
+
+### Referencing Jira tickets in commit messages and the PR body
+The GitHub for Jira app links a PR to a Jira ticket's Development panel whenever it finds an issue key (`OPIK-1234`, project key + hyphen + digits) in the branch name, PR title, PR body, or any commit message. It matches on the pattern alone — it can't tell "this PR resolves the ticket" from "this just mentions it" — and the link can't be removed afterward. To keep a ticket's Development panel reflecting only the work that actually touched it:
+- Tickets this PR **resolves** → keep the hyphen: `OPIK-1234`. Jira links/URLs are fine and wanted. A PR may resolve more than one ticket — list all of them this way.
+- Tickets **related but not resolved** in this PR (an escalation, a fix that references an older ticket — anything not in the PR title or branch) → replace the hyphen with an underscore (`OPIK_7000`) so the scanner can't match it, and do **not** paste a Jira URL for them (the URL contains the hyphenated key and links anyway).
+- Branch name, PR title, and the `## Issues` section are unaffected — resolved tickets use normal `OPIK-1234` keys there.
+
+This applies to new PRs only; once a stray key has linked a ticket it generally can't be un-linked.
+
+## AI-assisted contributions
+AI assistance is allowed, but human authors remain accountable for correctness, licensing, and security.
+
+Rules:
+- Always run relevant tests/linters for touched code.
+- Always be explicit about human/users interaction with produced output.
+- Always review prior issues, pull requests, and existing code for related solutions.
+- Always address system-generated reviews (Baz, Greptile).
+- Never submit unreviewed AI output.
+- Never include secrets, tokens, private prompts, internal system instructions, or customer-sensitive data in generated/public content.
+- Never disclose vulnerabilities, exploit steps, or incident details in public issues/PRs (use private maintainer/security channels).
+- Include the PR template AI watermark/disclosure block when AI is used.
+
+## Code quality (pre-commit)
+Linters and formatters are orchestrated by the [pre-commit](https://pre-commit.com/) framework
+from the single root `.pre-commit-config.yaml` (the source of truth for which checks run on which paths).
+
+- Install once per clone: `pip install pre-commit` (or `brew install pre-commit`), then `make hooks`.
+  Use pre-commit 3.0+ (developed on 4.x); the hook is shared across all worktrees, so install it once.
+- On commit, only the hooks matching your changed files run. If a formatter fixes a file, the commit
+  is aborted and the fixes are left **unstaged** — review them, `git add`, and commit again.
+- Run the same checks over your whole branch diff: `make precommit`. Full-repo audit: `make precommit-all`.
+- Java (Spotless), frontend/TS (ESLint + typecheck) hooks use the repo's own Maven/Node toolchains,
+  so they only run for contributors already set up for those areas.
+
+## Agent/editor setup
+- Cursor compatibility: `make cursor` (`.cursor -> .agents`)
+- Codex compatibility: `make codex` (`.codex -> .agents`, generates `AGENTS.override.md` from `.agents/rules/*.mdc`)
+- Claude sync: `make claude` (syncs `.agents` to `.claude`)
+- Git hooks: `make hooks` (installs the pre-commit framework hook; see Code quality above)

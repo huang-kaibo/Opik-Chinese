@@ -1,0 +1,141 @@
+import os
+
+from setuptools import find_packages, setup
+
+project_urls = {"Source code": "https://github.com/comet-ml/opik"}
+
+HERE = os.path.abspath(os.path.dirname(__file__))
+version = os.environ.get("VERSION")
+if version is None:
+    version_file = os.path.join(HERE, "..", "..", "version.txt")
+    if os.path.exists(version_file):
+        with open(version_file) as fp:
+            version = fp.read().strip()
+    else:
+        version = "0.0.1"
+
+setup(
+    author="Comet ML Inc.",
+    author_email="mail@comet.com",
+    python_requires=">=3.10",
+    classifiers=[
+        "Development Status :: 2 - Pre-Alpha",
+        "Intended Audience :: Developers",
+        "License :: OSI Approved :: Apache Software License",
+        "Natural Language :: English",
+        "Programming Language :: Python :: 3 :: Only",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
+    ],
+    description="Comet tool for logging and evaluating LLM traces",
+    long_description=open(
+        os.path.join(HERE, "..", "..", "README.md"), encoding="utf-8"
+    ).read(),
+    long_description_content_type="text/markdown",
+    install_requires=[
+        "boto3-stubs[bedrock-runtime]>=1.34.110",
+        "click",
+        "httpx",  # some older version of openai/litellm are broken with httpx>=0.28.0
+        "rapidfuzz>=3.0.0,<4.0.0",
+        # LiteLLM dependency comments:
+        # Please keep this list in sync with the one in sdks/opik_optimizer/pyproject.toml
+        # - Exclude 1.82.7, 1.82.8: compromised in supply chain attack (TeamPCP)
+        #   See: https://docs.litellm.ai/blog/security-update-march-2026
+        # - Exclude 1.81.*, 1.82.*, 1.83.0-1.83.6: CVE-2026-42208 (SQL injection in proxy auth path,
+        #   affects 1.81.16-1.83.6, fixed in 1.83.7).
+        #   See: https://docs.litellm.ai/blog/cve-2026-42208-litellm-proxy-sql-injection
+        # - Exclude 1.92.*: core completion() eagerly imports litellm.proxy modules that require
+        #   fastapi/orjson (proxy-only extras), so any completion crashes without litellm[proxy].
+        #   Reverted in 1.93. See litellm/main.py -> responses.mcp.litellm_proxy_mcp_handler.
+        # - Cap Python 3.10 at <1.97: litellm declares requires-python >=3.10 but ships 3.11+
+        #   typing, and every recent break has been 3.10-only with a distinct root cause:
+        #     1.97.*     Message model unconstructible -- the nested forward reference
+        #                ChatCompletionReasoningSummaryTextBlock never resolves, so every
+        #                completion() raises PydanticUserError.
+        #                https://github.com/BerriAI/litellm/issues/36384
+        #     1.98.0rc1  ImportError: cannot import name 'NotRequired' from 'typing'
+        #                typing.NotRequired does not exist on 3.10 (added in 3.11);
+        #                litellm should import it from typing_extensions.
+        #   Both are still unfixed on litellm main, so 1.99+ is expected to break on 3.10 too.
+        #   The cap is the standing guard; 3.11+ deliberately stays uncapped. Lift it once
+        #   upstream actually tests 3.10 (or once we drop 3.10 -- see OPIK_7955).
+        "litellm>=1.79.2,!=1.81.*,!=1.82.*,!=1.83.0,!=1.83.1,!=1.83.2,!=1.83.3,!=1.83.4,!=1.83.5,!=1.83.6,!=1.92.*,<1.97; python_version < '3.11'",
+        "litellm>=1.79.2,!=1.81.*,!=1.82.*,!=1.83.0,!=1.83.1,!=1.83.2,!=1.83.3,!=1.83.4,!=1.83.5,!=1.83.6,!=1.92.*; python_version >= '3.11'",
+        "openai",
+        "pydantic-settings>=2.0.0,<3.0.0,!=2.9.0",
+        "pydantic>=2.0.0,<3.0.0",
+        "pytest",
+        "rich",
+        "sentry_sdk>=2.0.0",
+        "tenacity",
+        "tqdm",
+        "uuid6",
+        # Optional accelerator for JSON encoding; see opik/json_helpers.py. Guarded
+        # twice -- this marker keeps pip from attempting a source build where no
+        # wheel exists, and the import there is optional, so a missing orjson costs
+        # speed rather than breaking anything.
+        # An allowlist rather than a denylist: orjson publishes CPython wheels for
+        # these architectures only, and a denylist would let a future architecture
+        # through to a source build. armv7l is left out entirely because a marker
+        # cannot tell glibc (wheel exists) from musl (none).
+        (
+            "orjson>=3.9.10;"
+            " platform_python_implementation == 'CPython'"
+            " and platform_machine in 'x86_64 AMD64 aarch64 arm64 ARM64 i686 x86'"
+            " and (sys_platform != 'win32'"
+            " or platform_machine != 'ARM64'"
+            " or python_version >= '3.11')"
+        ),
+        "jinja2",
+        "watchfiles>=1.0.0,<2.0.0",
+        # tree-sitter is used for JS/TS syntax checking in bridge handlers.
+        # Pre-built wheels are missing for musllinux_aarch64 (Alpine on ARM64),
+        # and PEP 508 has no marker to distinguish musl from glibc, so we
+        # exclude all Linux aarch64 to avoid a source-build failure on Alpine.
+        # Affected glibc aarch64 users can manually:
+        #   pip install tree-sitter tree-sitter-javascript \
+        #     tree-sitter-typescript
+        (
+            "tree-sitter>=0.23,<1.0;"
+            " platform_machine != 'aarch64'"
+            " or sys_platform != 'linux'"
+        ),
+        (
+            "tree-sitter-javascript>=0.23,<1.0;"
+            " platform_machine != 'aarch64'"
+            " or sys_platform != 'linux'"
+        ),
+        (
+            "tree-sitter-typescript>=0.23,<1.0;"
+            " platform_machine != 'aarch64'"
+            " or sys_platform != 'linux'"
+        ),
+    ],
+    extras_require={
+        "proxy": [
+            "fastapi>=0.100.0",
+            "uvicorn>=0.23.0",
+        ],
+    },
+    entry_points={
+        "pytest11": [
+            "opik = opik.plugins.pytest.hooks",
+        ],
+        "console_scripts": ["opik = opik.cli:cli"],
+    },
+    keywords="opik",
+    name="opik",
+    include_package_data=True,
+    package_data={"opik": ["py.typed"]},
+    packages=find_packages("src"),
+    package_dir={"": "src"},
+    url="https://www.comet.com",
+    project_urls=project_urls,
+    version=version,
+    zip_safe=False,
+    license="Apache 2.0 License",
+)

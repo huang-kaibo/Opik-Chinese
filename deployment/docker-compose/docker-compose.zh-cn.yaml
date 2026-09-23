@@ -1,0 +1,10 @@
+services:
+  backend:
+    ports: !reset []
+  frontend:
+    image: opik-chinese-frontend:2.2.76
+    pull_policy: never
+    build: !reset null
+    ports: !override
+      - "127.0.0.1:5173:5173"
+    restart: unless-stopped

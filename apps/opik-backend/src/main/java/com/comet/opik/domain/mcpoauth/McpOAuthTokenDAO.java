@@ -1,0 +1,79 @@
+package com.comet.opik.domain.mcpoauth;
+
+import com.comet.opik.infrastructure.db.RevokedReasonMapper;
+import org.jdbi.v3.sqlobject.config.RegisterArgumentFactory;
+import org.jdbi.v3.sqlobject.config.RegisterColumnMapper;
+import org.jdbi.v3.sqlobject.config.RegisterConstructorMapper;
+import org.jdbi.v3.sqlobject.customizer.Bind;
+import org.jdbi.v3.sqlobject.customizer.BindMethods;
+import org.jdbi.v3.sqlobject.customizer.Define;
+import org.jdbi.v3.sqlobject.statement.SqlQuery;
+import org.jdbi.v3.sqlobject.statement.SqlUpdate;
+import org.jdbi.v3.stringtemplate4.UseStringTemplateEngine;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Optional;
+
+@RegisterConstructorMapper(McpOAuthToken.class)
+@RegisterArgumentFactory(RevokedReasonMapper.class)
+@RegisterColumnMapper(RevokedReasonMapper.class)
+interface McpOAuthTokenDAO {
+
+    @SqlUpdate("""
+            INSERT INTO mcp_oauth_tokens (id, token_hash, type, client_id, user_name, workspace_name, workspace_id,
+                resource, family_id, rotated_from_id, expires_at, absolute_expires_at)
+            VALUES (:bean.id, :bean.tokenHash, :bean.type, :bean.clientId, :bean.userName, :bean.workspaceName, :bean.workspaceId,
+                :bean.resource, :bean.familyId, :bean.rotatedFromId, :bean.expiresAt, :bean.absoluteExpiresAt)
+            """)
+    void save(@BindMethods("bean") McpOAuthToken token);
+
+    @SqlQuery("SELECT * FROM mcp_oauth_tokens WHERE token_hash = :tokenHash")
+    McpOAuthToken findByHash(@Bind("tokenHash") String tokenHash);
+
+    @SqlQuery("SELECT * FROM mcp_oauth_tokens WHERE family_id = :familyId AND workspace_id = :workspaceId")
+    List<McpOAuthToken> findFamily(@Bind("familyId") String familyId, @Bind("workspaceId") String workspaceId);
+
+    /**
+     * Whether any unrevoked, unexpired token still exists for this client_id of this user in this workspace.
+     * One client_id can hold several grants at once (a host re-authorizing while its previous grant is live
+     * starts a new family), so revoking one family does not by itself mean the client is disconnected.
+     */
+    @SqlQuery("""
+            SELECT EXISTS (
+                SELECT 1 FROM mcp_oauth_tokens
+                WHERE user_name = :userName
+                  AND workspace_id = :workspaceId
+                  AND client_id = :clientId
+                  AND revoked_at IS NULL
+                  AND expires_at > NOW(6)
+            )
+            """)
+    boolean existsLiveToken(@Bind("userName") String userName, @Bind("workspaceId") String workspaceId,
+            @Bind("clientId") String clientId);
+
+    @UseStringTemplateEngine
+    @SqlUpdate("""
+            UPDATE mcp_oauth_tokens SET revoked_at = NOW(6), revoked_reason = :reason
+            WHERE <column> = :value AND revoked_at IS NULL
+            """)
+    int revokeBy(@Define("column") String column, @Bind("value") String value, @Bind("reason") RevokedReason reason);
+
+    default int revoke(String tokenHash, RevokedReason reason) {
+        return revokeBy("token_hash", tokenHash, reason);
+    }
+
+    default int revokeFamily(String familyId, RevokedReason reason) {
+        return revokeBy("family_id", familyId, reason);
+    }
+
+    @SqlUpdate("""
+            DELETE FROM mcp_oauth_tokens
+            WHERE (revoked_at IS NOT NULL AND revoked_at < :threshold) OR (expires_at < :threshold)
+            """)
+    int deleteExpiredAndRevoked(@Bind("threshold") Instant threshold);
+
+    default Optional<McpOAuthToken> fetch(String tokenHash) {
+        return Optional.ofNullable(findByHash(tokenHash));
+    }
+}

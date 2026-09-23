@@ -1,0 +1,78 @@
+const EVENT_PREFIX = "opik_";
+
+export const OpikEvent = {
+  ONBOARDING_INTENT_SELECTED: "opik_onboarding_intent_selected",
+  ONBOARDING_AGENT_NAME_SUBMITTED: "opik_onboarding_agent_name_submitted",
+  ONBOARDING_FIRST_TRACE_RECEIVED: "opik_onboarding_first_trace_received",
+  ONBOARDING_SKIPPED: "opik_onboarding_skipped",
+  MOBILE_ONBOARDING_ABANDONED: "opik_mobile_onboarding_abandoned",
+  MOBILE_ONBOARDING_EMAIL_SENT: "opik_mobile_onboarding_email_sent",
+  EVAL_SUITE_UI_CONFIGURED: "opik_eval_suite_ui_configured",
+  AGENT_CONFIG_UI_DEPLOYED: "opik_agent_config_ui_deployed",
+  OPTIMIZATION_WIZARD_STARTED: "opik_optimization_wizard_started",
+  FILTER_APPLIED: "opik_filter_applied",
+  FILTER_REMOVED: "opik_filter_removed",
+  FILTER_PINNED: "opik_filter_pinned",
+  FILTER_UNPINNED: "opik_filter_unpinned",
+  FILTER_DIALOG_OPENED: "opik_filter_dialog_opened",
+  FILTER_DIALOG_CLOSED_WITHOUT_SELECTION:
+    "opik_filter_dialog_closed_without_selection",
+  FILTERS_ACTIVE_COUNT: "opik_filters_active_count",
+  PINNED_FILTERS_COUNT: "opik_pinned_filters_count",
+  EXPLAIN_CLICKED: "opik_explain_clicked",
+  EXPLAIN_COMPLETED: "opik_explain_completed",
+  EXPLAIN_ERRORED: "opik_explain_errored",
+  EXPLAIN_CONTINUE_CLICKED: "opik_explain_continue_clicked",
+  EXPLAIN_RETRIED: "opik_explain_retried",
+  QUICK_FILTER_APPLIED: "opik_quick_filter_applied",
+  DIAGNOSTICS_RUN_CLICKED: "opik_diagnostics_run_clicked",
+  DIAGNOSTICS_RUN_COMPLETED: "opik_diagnostics_run_completed",
+  DIAGNOSTICS_RUN_FAILED: "opik_diagnostics_run_failed",
+  DIAGNOSTICS_TRY_AGAIN_CLICKED: "opik_diagnostics_try_again_clicked",
+  DIAGNOSTICS_AUTO_ENABLED: "opik_diagnostics_auto_enabled",
+  DIAGNOSTICS_AUTO_DISABLED: "opik_diagnostics_auto_disabled",
+  DIAGNOSTICS_ISSUE_RESOLVED: "opik_diagnostics_issue_resolved",
+  DIAGNOSTICS_ISSUE_REOPENED: "opik_diagnostics_issue_reopened",
+  DIAGNOSTICS_CONTINUE_WITH_OLLIE: "opik_diagnostics_continue_with_ollie",
+  TRACE_ERROR_EXPANDED: "opik_trace_error_expanded",
+  // Named after the surface they come from, not the control they sit on: the
+  // MCP entry points will multiply, and `opik_mcp_popover_opened` would not say
+  // which one opened. `opik_mcp_banner_*` below is the same shape.
+  MCP_HINT_SHOWN: "opik_mcp_hint_shown",
+  MCP_HINT_OPENED: "opik_mcp_hint_opened",
+  MCP_HINT_CLOSED: "opik_mcp_hint_closed",
+  MCP_HINT_CLIENT_CLICKED: "opik_mcp_hint_client_clicked",
+  MCP_HINT_PROMPT_COPIED: "opik_mcp_hint_prompt_copied",
+  MCP_HINT_DOCS_CLICKED: "opik_mcp_hint_docs_clicked",
+  MCP_BANNER_SHOWN: "opik_mcp_banner_shown",
+  MCP_BANNER_CTA_CLICKED: "opik_mcp_banner_cta_clicked",
+  MCP_BANNER_DISMISSED: "opik_mcp_banner_dismissed",
+} as const;
+
+type OpikEventValues = (typeof OpikEvent)[keyof typeof OpikEvent];
+export type OpikEventName = OpikEventValues extends never
+  ? string
+  : OpikEventValues;
+
+export const trackEvent = (
+  event: OpikEventName,
+  properties?: Record<string, unknown>,
+) => {
+  try {
+    if (!window.analytics) return;
+
+    const prefixedEvent = event.startsWith(EVENT_PREFIX)
+      ? event
+      : EVENT_PREFIX + event;
+
+    const environment =
+      window.environmentVariablesOverwrite?.OPIK_ANALYTICS_ENVIRONMENT;
+    const enrichedProperties = environment
+      ? { ...properties, environment }
+      : properties;
+
+    window.analytics.track(prefixedEvent, enrichedProperties);
+  } catch {
+    // no-op when Segment isn't available
+  }
+};

@@ -1,0 +1,8 @@
+node_modules/
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Test scripts
+test_nested_json_traces.py

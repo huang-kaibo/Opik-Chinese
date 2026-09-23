@@ -1,0 +1,824 @@
+package com.comet.opik.domain;
+
+import com.clickhouse.client.ClickHouseException;
+import com.comet.opik.api.BiInformationResponse;
+import com.comet.opik.api.DeleteTraceThreads;
+import com.comet.opik.api.Project;
+import com.comet.opik.api.ProjectStats;
+import com.comet.opik.api.Trace;
+import com.comet.opik.api.TraceBatch;
+import com.comet.opik.api.TraceBatchUpdate;
+import com.comet.opik.api.TraceCountResponse;
+import com.comet.opik.api.TraceDetails;
+import com.comet.opik.api.TraceThread;
+import com.comet.opik.api.TraceUpdate;
+import com.comet.opik.api.UsageByWorkspaceProjectUserResponse.WorkspaceProjectUserCount;
+import com.comet.opik.api.attachment.AttachmentInfo;
+import com.comet.opik.api.attachment.EntityType;
+import com.comet.opik.api.error.EntityAlreadyExistsException;
+import com.comet.opik.api.error.ErrorMessage;
+import com.comet.opik.api.error.IdentifierMismatchException;
+import com.comet.opik.api.events.TraceCostIntelligenceChanged;
+import com.comet.opik.api.events.TracesCreated;
+import com.comet.opik.api.events.TracesDeleted;
+import com.comet.opik.api.events.TracesUpdated;
+import com.comet.opik.api.sorting.TraceSortingFactory;
+import com.comet.opik.domain.attachment.AttachmentReinjectorService;
+import com.comet.opik.domain.attachment.AttachmentService;
+import com.comet.opik.domain.attachment.AttachmentStripperService;
+import com.comet.opik.domain.attachment.AttachmentUtils;
+import com.comet.opik.domain.utils.DemoDataExclusionUtils;
+import com.comet.opik.domain.utils.DemoDataExclusionUtils.WorkspaceProjectCount;
+import com.comet.opik.infrastructure.OpikConfiguration;
+import com.comet.opik.infrastructure.auth.RequestContext;
+import com.comet.opik.infrastructure.db.TransactionTemplateAsync;
+import com.comet.opik.infrastructure.lock.LockService;
+import com.comet.opik.utils.AsyncUtils;
+import com.comet.opik.utils.BinaryOperatorUtils;
+import com.comet.opik.utils.WorkspaceUtils;
+import com.google.common.base.Preconditions;
+import com.google.common.eventbus.EventBus;
+import com.google.inject.ImplementedBy;
+import io.opentelemetry.instrumentation.annotations.WithSpan;
+import io.r2dbc.spi.Connection;
+import jakarta.inject.Inject;
+import jakarta.inject.Singleton;
+import jakarta.ws.rs.ClientErrorException;
+import lombok.NonNull;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.http.HttpStatus;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+import ru.vyarus.dropwizard.guice.module.yaml.bind.Config;
+
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.UUID;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import static com.comet.opik.api.Trace.TracePage;
+import static com.comet.opik.utils.ErrorUtils.failWithNotFound;
+
+@ImplementedBy(TraceServiceImpl.class)
+public interface TraceService {
+
+    String PROJECT_NAME_AND_WORKSPACE_NAME_MISMATCH = "Project name and workspace name do not match the existing trace";
+
+    Mono<UUID> create(Trace trace);
+
+    Mono<Long> create(TraceBatch batch);
+
+    Mono<Void> update(TraceUpdate trace, UUID id);
+
+    Mono<Void> batchUpdate(TraceBatchUpdate batchUpdate);
+
+    Mono<Trace> get(UUID id);
+
+    Mono<Trace> get(UUID id, boolean stripAttachments);
+
+    Flux<Trace> getByIds(List<UUID> ids);
+
+    Mono<TraceDetails> getTraceDetailsById(UUID id);
+
+    Mono<Void> delete(Set<UUID> ids, UUID projectId);
+
+    Mono<TracePage> find(int page, int size, TraceSearchCriteria criteria);
+
+    Mono<Boolean> existsByProjectId(TraceSearchCriteria criteria, boolean threadScoped);
+
+    Mono<Boolean> validateTraceWorkspace(String workspaceId, Set<UUID> traceIds);
+
+    /**
+     * Previous-day trace counts per workspace, excluding activity in demo projects — including demo projects
+     * created after install, which earlier counted. {@link DemoDataExclusionUtils} carries the why.
+     */
+    Mono<TraceCountResponse> countTracesPerWorkspace();
+
+    /** The same window and exclusion as {@link #countTracesPerWorkspace()}, broken down by user for the BI events. */
+    Mono<BiInformationResponse> getTraceBIInformation();
+
+    Mono<ProjectStats> getStats(TraceSearchCriteria searchCriteria);
+
+    /** Previous-day traces across every workspace, under the same exclusion as {@link #countTracesPerWorkspace()}. */
+    Mono<Long> getDailyCreatedCount();
+
+    Mono<Set<UUID>> getProjectsWithTracesInRange(@NonNull Collection<Pair<String, UUID>> workspaceProjectPairs,
+            @NonNull Instant from, @NonNull Instant to);
+
+    Mono<Void> deleteTraceThreads(DeleteTraceThreads traceThreads);
+
+    Flux<Trace> search(int limit, TraceSearchCriteria searchCriteria);
+
+    Mono<Long> countTraces(Set<UUID> projectIds);
+
+    Mono<List<TraceThread>> getMinimalThreadInfoByIds(UUID projectId, Set<String> threadId);
+}
+
+@Slf4j
+@Singleton
+@RequiredArgsConstructor(onConstructor_ = @Inject)
+class TraceServiceImpl implements TraceService {
+
+    public static final String TRACE_KEY = "Trace";
+
+    private final @NonNull TraceDAO dao;
+    private final @NonNull DeletionEventDAO deletionEventDAO;
+    private final @NonNull TransactionTemplateAsync template;
+    private final @NonNull ProjectService projectService;
+    private final @NonNull IdGenerator idGenerator;
+    private final @NonNull LockService lockService;
+    private final @NonNull EventBus eventBus;
+    private final @NonNull TraceSortingFactory traceSortingFactory;
+    private final @NonNull AttachmentStripperService attachmentStripperService;
+    private final @NonNull AttachmentService attachmentService;
+    private final @NonNull AttachmentReinjectorService attachmentReinjectorService;
+    private final @NonNull @Config OpikConfiguration config;
+
+    @Override
+    @WithSpan
+    public Mono<UUID> create(@NonNull Trace trace) {
+
+        String projectName = WorkspaceUtils.getProjectName(trace.projectName());
+        UUID id = trace.id() == null ? idGenerator.generateId() : trace.id();
+
+        return Mono.deferContextual(ctx -> idGenerator
+                .validateIdAsync(id, TRACE_KEY)
+                .then(Mono.defer(() -> projectService.getOrCreate(projectName)))
+                .flatMap(project -> {
+                    String workspaceId = ctx.get(RequestContext.WORKSPACE_ID);
+                    String workspaceName = ctx.getOrDefault(RequestContext.WORKSPACE_NAME, "");
+                    String cipxDeviceId = ctx.getOrDefault(RequestContext.CIPX_DEVICE_ID, "");
+                    String userName = ctx.get(RequestContext.USER_NAME);
+
+                    // Strip attachments from the trace with the generated ID and project ID
+                    Trace traceWithId = trace.toBuilder().id(id).projectId(project.id()).build();
+                    return attachmentStripperService.stripAttachments(traceWithId, workspaceId,
+                            userName, projectName)
+                            .flatMap(processedTrace -> lockService.executeWithLock(
+                                    new LockService.Lock(id, TRACE_KEY),
+                                    Mono.defer(() -> insertTrace(processedTrace, project, id)))
+                                    .doOnSuccess(__ -> {
+                                        var savedTrace = processedTrace.toBuilder().projectId(project.id())
+                                                .projectName(projectName).build();
+                                        eventBus.post(new TracesCreated(List.of(savedTrace), workspaceId, userName,
+                                                workspaceName, cipxDeviceId));
+                                    }));
+                }));
+    }
+
+    @WithSpan
+    public Mono<Long> create(TraceBatch batch) {
+
+        Preconditions.checkArgument(!batch.traces().isEmpty(), "Batch traces cannot be empty");
+
+        List<Trace> dedupedTraces = dedupTraces(batch.traces());
+
+        List<String> projectNames = dedupedTraces
+                .stream()
+                .map(Trace::projectName)
+                .map(WorkspaceUtils::getProjectName)
+                .distinct()
+                .toList();
+
+        // Delete only auto-stripped attachments for all traces in the batch before processing
+        // This prevents duplicate auto-stripped attachments when the SDK sends the same trace data multiple times
+        // while preserving user-uploaded attachments
+        Set<UUID> traceIds = dedupedTraces.stream()
+                .map(Trace::id)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+
+        // Fail fast on invalid ids BEFORE any side effect below (auto-stripped attachment deletion, project
+        // creation), so a rejected batch never mutates state. Runs inside deferContextual so the audit
+        // metric can attribute the batch's own ids to the request workspace.
+        return Mono.deferContextual(validationCtx -> {
+            String validationWorkspaceId = validationCtx.get(RequestContext.WORKSPACE_ID);
+            dedupedTraces.forEach(trace -> {
+                if (trace.id() != null) {
+                    idGenerator.validateId(trace.id(), TRACE_KEY, validationWorkspaceId);
+                }
+            });
+            return attachmentService.deleteAutoStrippedAttachments(EntityType.TRACE, traceIds);
+        })
+                .then(Mono.deferContextual(ctx -> {
+                    String workspaceId = ctx.get(RequestContext.WORKSPACE_ID);
+                    String workspaceName = ctx.getOrDefault(RequestContext.WORKSPACE_NAME, "");
+                    String cipxDeviceId = ctx.getOrDefault(RequestContext.CIPX_DEVICE_ID, "");
+                    String userName = ctx.get(RequestContext.USER_NAME);
+
+                    Mono<List<Trace>> resolveProjects = Flux.fromIterable(projectNames)
+                            .flatMap(projectService::getOrCreate)
+                            .collectList()
+                            .map(projects -> bindTraceToProjectAndId(dedupedTraces, projects))
+                            .flatMapMany(Flux::fromIterable)
+                            .flatMap(trace -> attachmentStripperService.stripAttachments(trace, workspaceId,
+                                    userName,
+                                    trace.projectName()))
+                            .collectList();
+
+                    return resolveProjects
+                            .flatMap(traces -> template
+                                    .nonTransaction(connection -> dao.batchInsert(traces, connection))
+                                    .doOnSuccess(__ -> {
+                                        eventBus.post(new TracesCreated(traces, workspaceId, userName,
+                                                workspaceName, cipxDeviceId));
+                                    }));
+                }));
+    }
+
+    private List<Trace> dedupTraces(List<Trace> initialTraces) {
+
+        Map<Boolean, List<Trace>> shouldBeDeduped = initialTraces.stream()
+                .collect(Collectors.partitioningBy(trace -> trace.id() != null && trace.lastUpdatedAt() != null));
+
+        List<Trace> result = new ArrayList<>(shouldBeDeduped.get(false));
+
+        Collection<Trace> dedupedTraces = shouldBeDeduped.get(true)
+                .stream()
+                .collect(Collectors.toMap(
+                        Trace::id,
+                        Function.identity(),
+                        (trace1, trace2) -> trace1.lastUpdatedAt().isAfter(trace2.lastUpdatedAt()) ? trace1 : trace2))
+                .values();
+
+        result.addAll(dedupedTraces);
+
+        return result;
+    }
+
+    private List<Trace> bindTraceToProjectAndId(List<Trace> traces, List<Project> projects) {
+        Map<String, Project> projectPerName = projects.stream()
+                .collect(Collectors.toMap(
+                        WorkspaceUtils::stripProjectName,
+                        Function.identity(),
+                        BinaryOperatorUtils.last(),
+                        () -> new TreeMap<>(String.CASE_INSENSITIVE_ORDER)));
+
+        return traces
+                .stream()
+                .map(trace -> {
+                    String projectName = WorkspaceUtils.getProjectName(trace.projectName());
+                    Project project = projectPerName.get(projectName);
+
+                    // Ids are already validated up-front in create(TraceBatch); generated ids are inherently valid.
+                    UUID id = trace.id() == null ? idGenerator.generateId() : trace.id();
+
+                    return trace.toBuilder().id(id).projectId(project.id()).projectName(project.name()).build();
+                })
+                .toList();
+    }
+
+    private Mono<UUID> insertTrace(Trace newTrace, Project project, UUID id) {
+        return dao.getPartialById(id)
+                .flatMap(existingTrace -> insertTrace(newTrace, project, id, existingTrace))
+                .switchIfEmpty(Mono.defer(() -> create(newTrace, project, id)))
+                .onErrorResume(this::handleDBError);
+    }
+
+    private <T> Mono<T> handleDBError(Throwable ex) {
+        if (ex instanceof ClickHouseException
+                && ex.getMessage().contains("TOO_LARGE_STRING_SIZE")
+                && ex.getMessage().contains("String too long for type FixedString")
+                && (ex.getMessage().contains("project_id") || ex.getMessage().contains("workspace_id"))) {
+
+            return failWithConflict(PROJECT_NAME_AND_WORKSPACE_NAME_MISMATCH);
+        }
+
+        return TagOperations.mapTagLimitError(ex);
+    }
+
+    private Mono<Project> getProjectById(TraceUpdate traceUpdate) {
+        return AsyncUtils.makeMonoContextAware((userName, workspaceId) -> {
+
+            if (traceUpdate.projectId() != null) {
+                return Mono.fromCallable(() -> projectService.get(traceUpdate.projectId(), workspaceId));
+            }
+
+            return Mono.empty();
+        });
+    }
+
+    private Mono<UUID> insertTrace(Trace newTrace, Project project, UUID id, Trace existingTrace) {
+        return Mono.defer(() -> {
+            // check if a partial trace exists caused by a patch request
+            if (existingTrace.startTime().equals(Instant.EPOCH)
+                    && existingTrace.projectId().equals(project.id())) {
+
+                return create(newTrace, project, id);
+            }
+
+            if (!project.id().equals(existingTrace.projectId())) {
+                return failWithConflict(PROJECT_NAME_AND_WORKSPACE_NAME_MISMATCH);
+            }
+
+            // otherwise, reject the trace creation
+            return Mono
+                    .error(new EntityAlreadyExistsException(new ErrorMessage(List.of("Trace already exists"))));
+        });
+    }
+
+    private Mono<UUID> create(Trace trace, Project project, UUID id) {
+        return template.nonTransaction(connection -> {
+            var newTrace = trace.toBuilder().id(id).projectId(project.id()).build();
+            return dao.insert(newTrace, connection);
+        });
+    }
+
+    @Override
+    @WithSpan
+    public Mono<Void> update(@NonNull TraceUpdate traceUpdate, @NonNull UUID id) {
+
+        var projectName = WorkspaceUtils.getProjectName(traceUpdate.projectName());
+
+        return Mono.deferContextual(ctx -> idGenerator
+                .validateIdNotInFutureAsync(id, TRACE_KEY)
+                .then(getProjectById(traceUpdate)
+                        .switchIfEmpty(Mono.defer(() -> projectService.getOrCreate(projectName)))
+                        .subscribeOn(Schedulers.boundedElastic())
+                        .flatMap(project -> lockService.executeWithLock(
+                                new LockService.Lock(id, TRACE_KEY),
+                                Mono.defer(() -> dao.getPartialById(id)
+                                        .flatMap(trace -> updateOrFail(traceUpdate, id, trace, project).thenReturn(id))
+                                        .switchIfEmpty(Mono.defer(() -> insertUpdate(project, traceUpdate, id))
+                                                .thenReturn(id))
+                                        .onErrorResume(this::handleDBError)
+                                        .doOnSuccess(__ -> eventBus.post(new TracesUpdated(
+                                                Set.of(project.id()),
+                                                Set.of(id),
+                                                ctx.get(RequestContext.WORKSPACE_ID),
+                                                ctx.get(RequestContext.USER_NAME),
+                                                traceUpdate,
+                                                ctx.getOrDefault(RequestContext.WORKSPACE_NAME, ""),
+                                                Map.of(id, project.id()))))
+                                        .doOnSuccess(__ -> eventBus.post(new TraceCostIntelligenceChanged(
+                                                Map.of(id, project.id()), traceUpdate,
+                                                ctx.get(RequestContext.WORKSPACE_ID),
+                                                ctx.get(RequestContext.USER_NAME),
+                                                ctx.getOrDefault(RequestContext.CIPX_DEVICE_ID, "")))))))
+                        .then()));
+    }
+
+    @Override
+    @WithSpan
+    public Mono<Void> batchUpdate(@NonNull TraceBatchUpdate batchUpdate) {
+        log.info("Batch updating '{}' traces", batchUpdate.ids().size());
+
+        boolean mergeTags = Boolean.TRUE.equals(batchUpdate.mergeTags());
+        return Mono.deferContextual(ctx -> {
+            String workspaceId = ctx.get(RequestContext.WORKSPACE_ID);
+            String userName = ctx.get(RequestContext.USER_NAME);
+            String workspaceName = ctx.getOrDefault(RequestContext.WORKSPACE_NAME, "");
+            String cipxDeviceId = ctx.getOrDefault(RequestContext.CIPX_DEVICE_ID, "");
+            return dao.getProjectIdsByTraceIds(new ArrayList<>(batchUpdate.ids()))
+                    .flatMap(traceToProjectMap -> {
+                        var projectIds = Set.copyOf(traceToProjectMap.values());
+                        return dao.bulkUpdate(batchUpdate.ids(), batchUpdate.update(), mergeTags)
+                                .onErrorResume(TagOperations::mapTagLimitError)
+                                .doOnSuccess(__ -> {
+                                    log.info("Completed batch update for '{}' traces", batchUpdate.ids().size());
+                                    eventBus.post(new TracesUpdated(projectIds, batchUpdate.ids(), workspaceId,
+                                            userName, batchUpdate.update(), workspaceName, traceToProjectMap));
+                                    eventBus.post(new TraceCostIntelligenceChanged(traceToProjectMap,
+                                            batchUpdate.update(), workspaceId, userName, cipxDeviceId));
+                                });
+                    });
+        });
+    }
+
+    private Mono<Void> insertUpdate(Project project, TraceUpdate traceUpdate, UUID id) {
+        return Mono.deferContextual(ctx -> {
+            String workspaceId = ctx.get(RequestContext.WORKSPACE_ID);
+            String userName = ctx.get(RequestContext.USER_NAME);
+            String projectName = project.name();
+
+            // Strip attachments from the new trace data before inserting
+            return attachmentStripperService.stripAttachments(
+                    traceUpdate, id, workspaceId, userName, projectName)
+                    .flatMap(processedUpdate -> template.nonTransaction(
+                            connection -> dao.partialInsert(project.id(), processedUpdate, id, connection)));
+        });
+    }
+
+    private Mono<Void> updateOrFail(TraceUpdate traceUpdate, UUID id, Trace trace, Project project) {
+        if (!project.id().equals(trace.projectId())) {
+            return failWithConflict(PROJECT_NAME_AND_WORKSPACE_NAME_MISMATCH);
+        }
+
+        return Mono.deferContextual(ctx -> {
+            String workspaceId = ctx.get(RequestContext.WORKSPACE_ID);
+            String userName = ctx.get(RequestContext.USER_NAME);
+            String projectName = project.name();
+
+            // Step 1: Get existing attachments OUTSIDE the database transaction
+            return attachmentService.getAttachmentInfoByEntity(id, EntityType.TRACE, trace.projectId())
+                    .flatMap(existingAttachments ->
+            // Step 2: Strip attachments OUTSIDE the database transaction
+            attachmentStripperService.stripAttachments(
+                    traceUpdate, id, workspaceId, userName, projectName)
+                    .flatMap(processedUpdate ->
+            // Step 3: Update in database transaction
+            template.nonTransaction(connection -> dao.update(processedUpdate, id, connection))
+                    .then(Mono.defer(() -> {
+                        // Step 4: Delete only auto-stripped attachments from the old data
+                        // User-uploaded attachments are preserved unless explicitly removed by user
+                        List<AttachmentInfo> autoStrippedAttachments = AttachmentUtils
+                                .filterAutoStrippedAttachments(existingAttachments);
+
+                        if (autoStrippedAttachments.isEmpty()) {
+                            return Mono.empty();
+                        }
+
+                        return attachmentService.deleteSpecificAttachments(autoStrippedAttachments, id,
+                                EntityType.TRACE, trace.projectId());
+                    }))));
+        });
+    }
+
+    private Mono<Project> getProjectByName(String projectName) {
+        return Mono.deferContextual(ctx -> {
+            String workspaceId = ctx.get(RequestContext.WORKSPACE_ID);
+
+            return Mono.fromCallable(() -> projectService.findByNames(workspaceId, List.of(projectName)))
+                    .flatMap(projects -> projects.stream().findFirst().map(Mono::just).orElseGet(Mono::empty))
+                    .subscribeOn(Schedulers.boundedElastic());
+        });
+    }
+
+    private Mono<TraceSearchCriteria> findProjectAndVerifyVisibility(TraceSearchCriteria criteria) {
+        return projectService.resolveProjectIdAndVerifyVisibility(criteria.projectId(), criteria.projectName())
+                .map(projectId -> criteria.toBuilder()
+                        .projectId(projectId)
+                        .build());
+    }
+
+    private <T> Mono<T> failWithConflict(String error) {
+        log.info(error);
+        return Mono.error(new IdentifierMismatchException(new ErrorMessage(List.of(error))));
+    }
+
+    @Override
+    @WithSpan
+    public Mono<Trace> get(@NonNull UUID id) {
+        return get(id, false);
+    }
+
+    @WithSpan
+    public Mono<Trace> get(@NonNull UUID id, boolean stripAttachments) {
+        return template.nonTransaction(connection -> dao.findById(id, connection))
+                .switchIfEmpty(Mono.defer(() -> Mono.error(failWithNotFound("Trace", id))))
+                .flatMap(trace -> attachmentReinjectorService.reinjectAttachments(trace, !stripAttachments));
+    }
+
+    @Override
+    @WithSpan
+    public Flux<Trace> getByIds(@NonNull List<UUID> ids) {
+        Preconditions.checkArgument(!ids.isEmpty(), "ids must not be empty");
+        log.info("Fetching '{}' traces by IDs", ids.size());
+
+        return template.stream(connection -> dao.findByIds(ids, connection));
+    }
+
+    @Override
+    public Mono<TraceDetails> getTraceDetailsById(UUID id) {
+        return template.nonTransaction(connection -> dao.getTraceDetailsById(id, connection))
+                .switchIfEmpty(Mono.defer(() -> Mono.error(failWithNotFound("Trace", id.toString()))));
+    }
+
+    /**
+     * Deletes the given trace ids. With an explicit {@code projectId}, deletes only within that project. Without one
+     * (delete-by-id, or a batch spanning projects), resolves every owning project for each id and deletes it under the
+     * full {@code (workspace_id, project_id, id)} key, once per project group - so an id reused across projects is
+     * removed from all of them and no delete is ever project-less (OPIK-7483). Ids that resolve to no owning project
+     * have no live trace anywhere and are skipped: no {@code TracesDeleted} is emitted for them, because a project-less
+     * cascade would be an unscoped, workspace-wide child delete that could over-delete a concurrently-ingested trace's
+     * children; genuine orphan child rows are cleaned via the child entities' own delete endpoints.
+     */
+    @Override
+    @WithSpan
+    public Mono<Void> delete(@NonNull Set<UUID> ids, UUID projectId) {
+        Preconditions.checkArgument(CollectionUtils.isNotEmpty(ids), "Argument 'ids' must not be empty");
+        log.info("Deleting traces, count '{}'", ids.size());
+
+        if (projectId != null) {
+            var pairs = ids.stream().map(id -> Pair.of(projectId, id)).collect(Collectors.toUnmodifiableSet());
+            return template.nonTransaction(connection -> delete(pairs, connection));
+        }
+
+        log.info("Resolving owning projects to delete traces, count '{}'", ids.size());
+        return resolveOwningProjects(ids)
+                .flatMap(projectsByTrace -> {
+                    // Flatten to (project_id, trace_id) pairs so a reused id maps to one pair per owning project.
+                    var pairs = projectsByTrace.entrySet().stream()
+                            .flatMap(entry -> entry.getValue().stream()
+                                    .map(project -> Pair.of(project, entry.getKey())))
+                            .collect(Collectors.toUnmodifiableSet());
+
+                    // Resolution only returns queried ids, so its key set is a subset of ids.
+                    var unresolvedIds = ids.stream()
+                            .filter(id -> !projectsByTrace.containsKey(id))
+                            .collect(Collectors.toUnmodifiableSet());
+                    if (!unresolvedIds.isEmpty()) {
+                        // No live trace in any project: skip, emitting no project-less cascade (see delete() javadoc).
+                        log.info(
+                                "Trace ids with no live row (already absent), skipped from trace delete '{}', total '{}'",
+                                unresolvedIds.size(), ids.size());
+                    }
+
+                    return pairs.isEmpty()
+                            ? Mono.empty()
+                            : template.nonTransaction(connection -> delete(pairs, connection));
+                });
+    }
+
+    /**
+     * Resolves every owning project for each id: a bounded fast pass, then an unbounded pass over only the ids the
+     * bounded one leaves unresolved. Returns id -> owning projects; ids absent from the result have no live row.
+     * <p>
+     * The bounded pass's week window can miss a row whose week {@link com.comet.opik.utils.WeeklyPartitions#groupByPartition}
+     * cannot derive exactly — an id at or past the end of {@code DateTime64}'s range, where {@code id_at} saturates
+     * to {@code 2299-12-31} whatever the real week — so the unbounded pass re-resolves the miss set and the bounded
+     * query is never a delete's sole resolver. A far-future timestamp short of that ceiling is no longer such a case:
+     * since OPIK-7456 both sides of the window are Date32 and the fast pass resolves it. The resolver-query javadocs
+     * cover how each pass prunes.
+     */
+    private Mono<Map<UUID, Set<UUID>>> resolveOwningProjects(Set<UUID> ids) {
+        return dao.getAllProjectIdsByTraceIdsBounded(ids)
+                .flatMap(bounded -> {
+                    var missSet = ids.stream()
+                            .filter(id -> !bounded.containsKey(id))
+                            .collect(Collectors.toUnmodifiableSet());
+                    if (missSet.isEmpty()) {
+                        return Mono.just(bounded);
+                    }
+                    log.info(
+                            "Bounded project resolution incomplete, re-resolving miss set unbounded, missed '{}', total '{}'",
+                            missSet.size(), ids.size());
+                    return dao.getAllProjectIdsByTraceIds(missSet)
+                            .map(unbounded -> {
+                                // Keys are disjoint: unbounded only carries the miss set, none of which is in bounded.
+                                var merged = new HashMap<>(bounded);
+                                merged.putAll(unbounded);
+                                return merged;
+                            });
+                });
+    }
+
+    /**
+     * All-or-nothing over the batch: an error anywhere skips {@code TracesDeleted} for every pair, not just the failed
+     * one. OPIK-8230 widens the window — the DAO can now emit several statements per batch, so earlier partitions' rows
+     * may already be gone. Deletes are idempotent; restructuring this coupling is out of that ticket's scope. The
+     * deletion-events capture is outside it: it runs first, so a failed or partially-applied delete is still recorded.
+     */
+    private Mono<Void> delete(Set<Pair<UUID, UUID>> projectIdTraceIdPairs, Connection connection) {
+        return Mono.deferContextual(ctx -> {
+            String workspaceId = ctx.get(RequestContext.WORKSPACE_ID);
+            String userName = ctx.get(RequestContext.USER_NAME);
+            // Deferred so the delete is assembled after the capture rather than alongside it: TraceDAO.delete
+            // validates and logs eagerly.
+            return captureDeletions(projectIdTraceIdPairs, workspaceId, userName)
+                    .then(Mono.defer(() -> dao.delete(projectIdTraceIdPairs, connection)))
+                    .doOnSuccess(_ -> projectIdTraceIdPairs.stream()
+                            .collect(Collectors.groupingBy(Pair::getLeft,
+                                    Collectors.mapping(Pair::getRight, Collectors.toUnmodifiableSet())))
+                            .forEach((projectId, traceIds) -> {
+                                eventBus.post(TracesDeleted.builder()
+                                        .traceIds(traceIds)
+                                        .projectId(projectId)
+                                        .workspaceId(workspaceId)
+                                        .userName(userName)
+                                        .build());
+                                log.info(
+                                        "Published TracesDeleted event, trace ids count '{}', project id '{}', workspace '{}'",
+                                        traceIds.size(), projectId, workspaceId);
+                            }));
+        });
+    }
+
+    /**
+     * Records the (project_id, trace_id) pairs about to be deleted in the deletion-events bridge, so deletes issued
+     * while the table is being migrated survive the copy, and so a rollback re-applies them instead of resurrecting the
+     * rows.
+     * <p>
+     * Runs <b>before</b> the delete (OPIK-8141). The bridge is the only record of a lightweight delete, and a delete can
+     * fail its client while the server-side mutation still applies — the observed case being a client timeout on a
+     * mutation that then completed — so capturing afterwards let exactly those deletes go unrecorded, unrecoverably:
+     * neither replay direction can re-apply what the bridge does not name. Capturing first over-records instead when
+     * the delete does fail, which is the recoverable direction: the forward replay skips any id still live on the
+     * source, and a rollback re-applies a delete the user did ask for. The ordering is only worth something because the
+     * analytics connection carries {@code wait_for_async_insert = 1}: the insert completing means the rows are in the
+     * table, not merely queued in the async-insert buffer.
+     * <p>
+     * Still best-effort: a capture failure is logged and swallowed, never propagated. A lost event risks a resurrected
+     * row at the next copy or rollback, whereas failing the delete would impact live traffic — the worse trade for an
+     * auxiliary insert. No-op unless capture is enabled. Deferred so nothing is built or run until subscribed.
+     */
+    private Mono<Void> captureDeletions(Set<Pair<UUID, UUID>> projectIdTraceIdPairs, String workspaceId,
+            String userName) {
+        return Mono.defer(() -> {
+            if (!config.getDatabaseAnalyticsDataModel().traceDeletionEventsCaptureEnabled()) {
+                return Mono.empty();
+            }
+            var events = projectIdTraceIdPairs.stream()
+                    .map(pair -> DeletionEvent.builder()
+                            .sourceTable(SourceTable.TRACES)
+                            .workspaceId(workspaceId)
+                            .projectId(pair.getLeft())
+                            .deletedId(pair.getRight().toString())
+                            .deletionReason(DeletionReason.USER_REQUEST)
+                            .build())
+                    .collect(Collectors.toUnmodifiableSet());
+            return deletionEventDAO.insert(events, userName)
+                    .doOnSuccess(_ -> log.info("Captured trace deletion events, count '{}' on workspace '{}'",
+                            events.size(), workspaceId))
+                    .onErrorResume(throwable -> {
+                        log.warn("Failed to capture trace deletion events, count '{}' on workspace '{}'",
+                                projectIdTraceIdPairs.size(), workspaceId, throwable);
+                        return Mono.empty();
+                    });
+        });
+    }
+
+    @Override
+    @WithSpan
+    public Mono<TracePage> find(int page, int size, @NonNull TraceSearchCriteria criteria) {
+        return findProjectAndVerifyVisibility(criteria)
+                .flatMap(resolvedCriteria -> template
+                        .nonTransaction(connection -> dao.find(size, page, resolvedCriteria, connection))
+                        .flatMap(tracePage -> {
+                            // If stripAttachments=false, reinject attachments into all traces
+                            var reinjectAttachments = !resolvedCriteria.stripAttachments();
+                            if (reinjectAttachments) {
+                                return Flux.fromIterable(tracePage.content())
+                                        .concatMap(trace -> attachmentReinjectorService
+                                                .reinjectAttachments(trace, reinjectAttachments))
+                                        .collectList()
+                                        .map(reinjectedTraces -> tracePage.toBuilder()
+                                                .content(reinjectedTraces)
+                                                .build());
+                            }
+                            return Mono.just(tracePage);
+                        }))
+                .switchIfEmpty(Mono.just(TracePage.empty(page, traceSortingFactory.getSortableFields())));
+    }
+
+    @Override
+    @WithSpan
+    public Mono<Boolean> existsByProjectId(@NonNull TraceSearchCriteria criteria, boolean threadScoped) {
+        return findProjectAndVerifyVisibility(criteria)
+                .flatMap(resolvedCriteria -> template
+                        .nonTransaction(
+                                connection -> dao.existsByProjectId(resolvedCriteria, threadScoped, connection)))
+                .switchIfEmpty(Mono.just(false));
+    }
+
+    @Override
+    @WithSpan
+    public Mono<Boolean> validateTraceWorkspace(@NonNull String workspaceId, @NonNull Set<UUID> traceIds) {
+        if (traceIds.isEmpty()) {
+            return Mono.just(true);
+        }
+
+        return template.nonTransaction(connection -> dao.getTraceWorkspace(traceIds, connection)
+                .map(traceWorkspace -> traceWorkspace.stream()
+                        .allMatch(trace -> workspaceId.equals(trace.workspaceId()))));
+    }
+
+    @Override
+    @WithSpan
+    public Mono<TraceCountResponse> countTracesPerWorkspace() {
+        return countsByWorkspaceExcludingDemoProjects()
+                .map(countsByWorkspace -> TraceCountResponse.builder()
+                        .workspacesTracesCount(countsByWorkspace.entrySet()
+                                .stream()
+                                .map(entry -> TraceCountResponse.WorkspaceTraceCount.builder()
+                                        .workspace(entry.getKey())
+                                        .traceCount(Math.toIntExact(entry.getValue()))
+                                        .build())
+                                .toList())
+                        .build());
+    }
+
+    @Override
+    @WithSpan
+    public Mono<BiInformationResponse> getTraceBIInformation() {
+        log.info("Getting trace BI events daily data");
+        return dao.getTraceBIInformationPerProject()
+                .collectList()
+                .flatMap(rows -> projectService
+                        .getDemoProjectIdsInWorkspaces(rows.stream()
+                                .map(WorkspaceProjectUserCount::workspaceId)
+                                .collect(Collectors.toSet()))
+                        .map(demoProjectIds -> DemoDataExclusionUtils.foldByWorkspaceAndUser(rows, demoProjectIds)))
+                .map(biInformation -> BiInformationResponse.builder()
+                        .biInformation(biInformation)
+                        .build());
+    }
+
+    /**
+     * Previous-day trace counts per workspace, with demo-project activity dropped. The demo lookup is scoped to the
+     * workspaces that actually had traces, which is what keeps it independent of how many demo projects exist.
+     */
+    private Mono<Map<String, Long>> countsByWorkspaceExcludingDemoProjects() {
+        return dao.countTracesPerWorkspaceProject()
+                .collectList()
+                .flatMap(rows -> projectService
+                        .getDemoProjectIdsInWorkspaces(rows.stream()
+                                .map(WorkspaceProjectCount::workspaceId)
+                                .collect(Collectors.toSet()))
+                        .map(demoProjectIds -> DemoDataExclusionUtils.foldByWorkspace(rows, demoProjectIds)));
+    }
+
+    @Override
+    @WithSpan
+    public Mono<ProjectStats> getStats(@NonNull TraceSearchCriteria criteria) {
+        return findProjectAndVerifyVisibility(criteria)
+                .flatMap(dao::getStats)
+                .switchIfEmpty(Mono.just(ProjectStats.empty()));
+    }
+
+    @Override
+    @WithSpan
+    public Mono<Long> getDailyCreatedCount() {
+        return countsByWorkspaceExcludingDemoProjects()
+                .map(countsByWorkspace -> countsByWorkspace.values()
+                        .stream()
+                        .mapToLong(Long::longValue)
+                        .sum());
+    }
+
+    @Override
+    public Mono<Set<UUID>> getProjectsWithTracesInRange(@NonNull Collection<Pair<String, UUID>> workspaceProjectPairs,
+            @NonNull Instant from, @NonNull Instant to) {
+        if (workspaceProjectPairs.isEmpty()) {
+            return Mono.just(Set.of());
+        }
+        return template.nonTransaction(
+                connection -> dao.getProjectsWithTracesInRange(workspaceProjectPairs, from, to, connection));
+    }
+
+    @Override
+    public Mono<Void> deleteTraceThreads(@NonNull DeleteTraceThreads traceThreads) {
+        if (traceThreads.projectId() == null && traceThreads.projectName() == null) {
+            return Mono.error(new ClientErrorException("must provide either a project_name or a project_id",
+                    HttpStatus.SC_UNPROCESSABLE_ENTITY));
+        }
+
+        if (traceThreads.projectId() != null) {
+            return deleteTraceThreadsByProjectId(traceThreads.projectId(), traceThreads.threadIds());
+        }
+
+        return getProjectByName(traceThreads.projectName())
+                .flatMap(project -> deleteTraceThreadsByProjectId(project.id(), traceThreads.threadIds()));
+    }
+
+    private Mono<Void> deleteTraceThreadsByProjectId(@NonNull UUID projectId, @NonNull List<String> threadIds) {
+        log.info("Deleting trace threads by project id '{}' and thread ids count '{}'", projectId, threadIds.size());
+
+        return Mono.deferContextual(ctx -> template.nonTransaction(connection ->
+        // First get all trace IDs for the thread IDs
+        dao.getTraceIdsByThreadIds(projectId, threadIds, connection)
+                .flatMap(traceIds -> {
+                    if (traceIds.isEmpty()) {
+                        log.info("No traces found for thread IDs, skipping deletion");
+                        return Mono.empty();
+                    }
+                    log.info("Found '{}' traces for thread IDs, proceeding with deletion", traceIds.size());
+
+                    var pairs = traceIds.stream().map(id -> Pair.of(projectId, id))
+                            .collect(Collectors.toUnmodifiableSet());
+                    return delete(pairs, connection);
+                })));
+    }
+
+    @Override
+    public Flux<Trace> search(int limit, @NonNull TraceSearchCriteria criteria) {
+        return findProjectAndVerifyVisibility(criteria)
+                .flatMapMany(it -> dao.search(limit, it)
+                        .concatMap(trace -> attachmentReinjectorService.reinjectAttachments(trace,
+                                !it.stripAttachments())));
+    }
+
+    @Override
+    public Mono<Long> countTraces(@NonNull Set<UUID> projectIds) {
+        return dao.countTraces(projectIds);
+    }
+
+    @Override
+    public Mono<List<TraceThread>> getMinimalThreadInfoByIds(@NonNull UUID projectId, @NonNull Set<String> threadId) {
+        return dao.getMinimalThreadInfoByIds(projectId, threadId)
+                .switchIfEmpty(Mono.just(List.of()));
+    }
+
+}
